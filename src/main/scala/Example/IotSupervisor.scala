@@ -1,8 +1,24 @@
 package Example
 
-import Example.DeviceManager.RequestTrackDevice
-import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, PoisonPill, Props, Terminated}
+import Example.DeviceGroupQuery.CollectionTimeout
+import Example.DeviceManager.{
+  DeviceNotAvailable,
+  RequestTrackDevice,
+  Temperature,
+  TemperatureNotAvailable,
+  TemperatureReading
+}
+import akka.actor.{
+  Actor,
+  ActorLogging,
+  ActorRef,
+  ActorSystem,
+  PoisonPill,
+  Props,
+  Terminated
+}
 
+import scala.concurrent.duration.FiniteDuration
 import scala.io.StdIn
 
 object IotSupervisor {
@@ -74,6 +90,18 @@ object DeviceManager {
 
   final case class RequestListOfDeviceGroups(requestId: Int)
   final case class ListOfDeviceGroups(requestId: Int, groupIds: Set[String])
+
+  final case class RequestAllTemperatures(requestId: Long)
+  final case class RespondAllTemperatures(
+    requestId: Long,
+    tempetatures: Map[String, TemperatureReading]
+  )
+
+  sealed trait TemperatureReading
+  final case class Temperature(value: Double) extends TemperatureReading
+  case object TemperatureNotAvailable extends TemperatureReading
+  case object DeviceNotAvailable extends TemperatureReading
+  case object DeviceTimedOut extends TemperatureReading
 }
 
 class DeviceManager extends Actor with ActorLogging {
@@ -164,4 +192,72 @@ class DeviceGroup(groupId: String) extends Actor with ActorLogging {
           if (deviceIdToActor.isEmpty) self ! PoisonPill
         }
   }
+}
+
+object DeviceGroupQuery {
+  def props(actorToDeviceId: Map[ActorRef, String],
+            requestId: Long,
+            requester: ActorRef,
+            timeout: FiniteDuration) =
+    Props(new DeviceGroupQuery(actorToDeviceId, requestId, requester, timeout))
+
+  case object CollectionTimeout
+}
+
+class DeviceGroupQuery(actorToDeviceId: Map[ActorRef, String],
+                       requestId: Long,
+                       requester: ActorRef,
+                       timeout: FiniteDuration)
+    extends Actor
+    with ActorLogging {
+  import DeviceGroupQuery._
+  import context.dispatcher
+
+  val queryTimeoutTimer =
+    context.system.scheduler.scheduleOnce(timeout, self, CollectionTimeout)
+
+  override def preStart(): Unit = {
+    actorToDeviceId.keysIterator.foreach({ deviceActor =>
+      context.watch(deviceActor)
+      deviceActor ! Device.ReadTemperature(0)
+    })
+  }
+
+  override def postStop(): Unit = {
+    queryTimeoutTimer.cancel()
+  }
+
+  def waitingForReplies(repliesSoFar: Map[String, TemperatureReading],
+                        stillWaiting: Set[ActorRef]): Receive = {
+    case Device.RespondTemperature(0, valueOption) =>
+      val deviceActor = sender()
+      val reading = valueOption match {
+        case Some(value) => Temperature(value)
+        case None        => TemperatureNotAvailable
+      }
+      receivedResponse(deviceActor, reading, stillWaiting, repliesSoFar)
+
+    case Terminated(deviceActor) =>
+      receivedResponse(
+        deviceActor,
+        DeviceNotAvailable,
+        stillWaiting,
+        repliesSoFar
+      )
+
+    case CollectionTimeout =>
+      val timedOutReplies =
+        stillWaiting.map { deviceActor =>
+          val deviceId = actorToDeviceId(deviceActor)
+          deviceId -> DeviceManager.DeviceTimedOut
+        }
+      requester ! DeviceManager.RespondAllTemperatures(
+        requestId,
+        repliesSoFar ++ timedOutReplies
+      )
+      context.stop(self)
+  }
+
+  override def receive: Receive =
+    waitingForReplies(Map.empty, actorToDeviceId.keySet)
 }
